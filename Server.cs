@@ -40,8 +40,8 @@ namespace Chatbox_Type_Shii
             {
                 while (!token.IsCancellationRequested)
                 {
-                    TcpClient client = listener.AcceptTcpClient();
-                    await Task.Run(() => HandleClientAsync(client, token), token);
+                    TcpClient client = await listener.AcceptTcpClientAsync();
+                    _ = Task.Run(() => HandleClientAsync(client, token), token);
                 }
             }
             catch (Exception ex)
