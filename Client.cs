@@ -1,90 +1,123 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading.Tasks;
+﻿using System.Diagnostics;
+using System.Reflection.PortableExecutable;
 
-namespace Chhatbox_type_shii
+namespace Chatbox_Type_Shii
 {
     public class Client
     {
-        private readonly CancellationTokenSource cts;
-        private TcpClient client;
-        private readonly CancellationToken token;
-        public Client()
+        private readonly int port = 5000;
+        private TcpClient? client;
+        private CancellationTokenSource? cts;
+
+        public async Task StartClient(string? IP)
         {
-            client = new TcpClient();
             cts = new CancellationTokenSource();
-            token = cts.Token;
-        }
-        public async Task Connect(string? inputIP, int port)
-        {
-            if (token.IsCancellationRequested)
-            {
-                Console.WriteLine("Exiting...");
-                return;
-            }
+            CancellationToken token = cts.Token;
+            client = new TcpClient();
             try
             {
-                IPAddress ip;
-                if (IPAddress.TryParse(inputIP, out var parsed))
+                if (IPAddress.TryParse(IP, out var parsed))
                 {
-                    ip = parsed;
+                    client.ConnectAsync(parsed, port).Wait(token);
                 }
                 else
                 {
-                    Console.WriteLine("Invalid IP address...");
-                    return;
+                    throw new ArgumentException("Invalid IP address.");
                 }
-                IPEndPoint ipEndPoint = new IPEndPoint(ip, port);
-                await client.ConnectAsync(ipEndPoint.Address, ipEndPoint.Port);
-                Console.WriteLine("Connected to the server...");
-                using (var Stream = client.GetStream())
-                using (StreamReader reader = new StreamReader(Stream, Encoding.UTF8))
-                using (StreamWriter writer = new StreamWriter(Stream, Encoding.UTF8) { AutoFlush = true })
-                {
-                    Console.Write("Enter your username: ");
-                    var message = Console.ReadLine();
-                    await writer.WriteLineAsync($"USERNAME:{message}");
-                    Task reading = ListenForMessages(reader, token);
-                        Task writing = SendMessages(writer, token);
-                        await Task.WhenAll(reading, writing);
-                }
+
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error: {ex.Message}");
+                Console.WriteLine($"Failed to connect to server: {ex.Message}");
+            }
+            await Task.Run(() => HandleMessages(client, token), token);
+        }
+        public async Task HandleMessages(TcpClient client, CancellationToken token)
+        {
+            {
+                NetworkStream stream = client.GetStream();
+                StreamReader reader = new StreamReader(stream);
+                StreamWriter writer = new StreamWriter(stream) { AutoFlush = true };
+                Task recieve = RecieveMessages(client, reader, stream, token);
+                Task send = SendMessages(client, writer, stream, token);
+                await Task.WhenAll(recieve, send);
             }
         }
-        public async Task ListenForMessages(StreamReader reader, CancellationToken token)
+        public async Task SendMessages(TcpClient client, StreamWriter writer, NetworkStream stream, CancellationToken token)
         {
-                while (!token.IsCancellationRequested)
+            string? userName;
+            string? input;
+            string? user;
+                Console.Write("Please enter your desired username: ");
+                input = Console.ReadLine();
+                while (true)
                 {
-                    var message = await reader.ReadLineAsync();
-                    if (message == null)
+                    if (string.IsNullOrWhiteSpace(input))
                     {
-                        Console.WriteLine("Server disconnected.");
-                        Disconnect();
+                        Console.Write("Username cannot be empty. Please enter a valid username: ");
+                    }
+                    else
+                    {
+                        userName = $"USERNAME: {input}";
+                        user = userName.Replace("USERNAME: ", "");
+                        await writer.WriteLineAsync(userName);
                         break;
                     }
-                    Console.WriteLine($"Received: {message}");
                 }
-        }
-        public async Task SendMessages(StreamWriter writer, CancellationToken token)
-        {
-                while (!token.IsCancellationRequested)
+            Console.WriteLine($"Connected to server as {user}.");
+            Console.WriteLine(@"Please input \msg for messages and \file for file sharing before typing your message.");
+            while (!token.IsCancellationRequested)
+            {
+                ChatPackets packet = new ChatPackets();
+                Console.Write("Enter message: ");
+                string? message = Console.ReadLine();
+                if (message == null) break;
+                if (message.StartsWith(@"\msg"))
                 {
-                    var message = Console.ReadLine();
-                    if (message == null) continue;
-                    await writer.WriteLineAsync(message);
+                    packet.Type = ChatPackets.PacketType.Message;
+                    packet.Username = user;
+                    packet.Content = message.Replace(@"\msg", "").Trim();
+                    string? json = JsonSerializer.Serialize(packet);
+                    await writer.WriteAsync(json);
+                    Console.WriteLine($"{user}: {message.Replace(@"\msg", "").Trim()}");
                 }
+                else if (message.StartsWith(@"\file"))
+                {
+                    Console.Write("Please input the file path: ");
+                    string? filePath = Console.ReadLine();
+                    if (!File.Exists(filePath))
+                    {
+                        Console.WriteLine("File not found.");
+                        continue;
+                    }
+                    Console.Write("\nPlease input the destination directory: ");
+                    string? destinationDirectory = Console.ReadLine();
+                    packet.Type = ChatPackets.PacketType.File;
+                    packet.Username = userName;
+                    packet.Content = filePath;
+                    packet.DestinationDirectory = destinationDirectory;
+                    packet.FileName = Path.GetFileName(filePath);
+                    FileInfo sourceFile = new FileInfo(filePath);
+                    byte[] fileBytes = File.ReadAllBytes(filePath);
+                    byte[] buffer = new byte[81920];
+                    int bytesSent = 0;
+                    long progress = 0;
+                    long totalBytes = sourceFile.Length;
+                    while ((bytesSent = await stream.ReadAsync(fileBytes, 0, buffer.Length, token)) > 0)
+                    {
+                        await stream.WriteAsync(buffer, 0, bytesSent, token);
+                        progress += bytesSent;
+                        Console.Write($"\rProgress: {(double)progress / totalBytes:P2}");
+                    }
+                    Console.WriteLine("\nFile copied Successfully");
+                }
+
+            }
+
         }
-        public void Disconnect()
+        public async Task RecieveMessages(TcpClient client, StreamReader reader, NetworkStream stream, CancellationToken token)
         {
-            cts.Cancel();
-            client.Close();
-            Console.WriteLine("Disconnected from the server...");
+            
         }
     }
 }

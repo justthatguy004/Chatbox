@@ -1,164 +1,196 @@
-﻿using System;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Net;
-using System.Text;
-using System.Net.Sockets;
-using System.IO;
-using System.Collections.Concurrent;
+﻿global using System;
+global using System.Text;
+global using System.Threading.Tasks;
+global using System.Net;
+global using System.IO;
+global using System.Collections.Concurrent;
+global using System.Net.Sockets;
+global using System.Text.Json;
+using System.Runtime.CompilerServices;
 
-namespace Chatbox_type_shii
+namespace Chatbox_Type_Shii
 {
     public class Server
     {
-        private int port = 5000;
-        public static ConcurrentDictionary<string, TcpClient> ConnectedClients = new();
-        public int Port
-        {
-            get { return port; }
-            set { port = value; }
-        }
+        private readonly int port = 5000;
         private TcpListener? listener;
         private CancellationTokenSource? cts;
-        public async Task StartServer(string? inputIP = null)
+        private ConcurrentDictionary<string, TcpClient> clients = new ConcurrentDictionary<string, TcpClient>();
+        public async Task StartServer(string? userIP)
         {
             if (cts != null)
+            {
                 throw new InvalidOperationException("Server is already running...");
+            }
             cts = new CancellationTokenSource();
             CancellationToken token = cts.Token;
-            await Task.Run(() => RunServerAsync(inputIP, token), token);
-        }
-        public void StopServer(string? inputIP)
-        {
+            IPHostEntry hostEntry = Dns.GetHostEntry(Dns.GetHostName());
+            IPAddress? hostIP;
             try
             {
-                cts?.Cancel();
-                listener?.Stop();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Problem stopping server: {ex.Message}");
-            }
-            finally
-            {
-                cts?.Dispose();
-                cts = null;
-            }
-        }
-        public static void AddClient(string? usernname, TcpClient client) => ConnectedClients.TryAdd(usernname ?? Guid.NewGuid().ToString().PadLeft(5, '0'), client);
-        public async Task RunServerAsync(string? inputIP, CancellationToken token)
-        {
-            try
-            {
-                ConnectedClients.Clear();
-                IPHostEntry hostEntry = Dns.GetHostEntry(Dns.GetHostName());
-                IPAddress? ipAddress;
-                if (!token.IsCancellationRequested && IPAddress.TryParse(inputIP, out var parsed))
+                if (IPAddress.TryParse(userIP, out var parsed))
                 {
-                    ipAddress = parsed;
+                    hostIP = parsed;
                 }
                 else
                 {
-                    ipAddress = hostEntry.AddressList.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork);
+                    hostIP = hostEntry.AddressList.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork);
                 }
-                if (ipAddress == null)
+                if (hostIP == null)
                 {
-                    Console.WriteLine("No valid IP address found...");
+                    Console.WriteLine("No suitable IP adress found...");
                     return;
                 }
-                IPEndPoint hostEndPoint = new IPEndPoint(ipAddress, Port);
-                listener = new TcpListener(hostEndPoint);
-                listener.Start();
-        Console.WriteLine($"Server started on {hostEndPoint}...");
-                while (!token.IsCancellationRequested)
-                {
-                    Console.WriteLine("Waiting for connection...");
-                    TcpClient client;
-                    try
-                    {
-                        client = await listener.AcceptTcpClientAsync();
-                        Console.WriteLine("Client connected");
-                        await Task.Run(() => HandleClientAsync(client, token), token);
-                    }
-                    catch (SocketException) when (token.IsCancellationRequested)
-                    {
-                        break;
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error stopping Server: {ex.Message}");
+                Console.WriteLine($"Error getting host IP: {ex.Message}");
+                return;
+            }
+            listener = new TcpListener(hostIP, port);
+            listener.Start();
+            await Task.Run(() => RunServerAsync(listener, token), token);
+        }
+        private async Task RunServerAsync(TcpListener listener, CancellationToken token)
+        {
+            Console.WriteLine($"Server started on {listener.LocalEndpoint}");
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    TcpClient client = await listener.AcceptTcpClientAsync();
+                    _ = HandleClientAsync(client, token);
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error accepting client: {ex.Message}");
+                }
             }
         }
         private async Task HandleClientAsync(TcpClient client, CancellationToken token)
         {
+            using (client)
+            using (NetworkStream stream = client.GetStream())
+            using (StreamReader reader = new StreamReader(stream))
+            using (StreamWriter writer = new StreamWriter(stream) { AutoFlush = true })
+            {
+                Task recieve = RecieveMessagesAsync(client, reader, stream, token);
+                Task send = SendMessagesAsync(client, writer, token);
+                await Task.WhenAny(recieve, send);
+            }
+        }
+        private async Task RecieveMessagesAsync(TcpClient client, StreamReader reader, NetworkStream stream, CancellationToken token)
+        {
             try
             {
-                    using (client)
-                    using (NetworkStream stream = client.GetStream())
-                    using (var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true })
-                    using (var reader = new StreamReader(stream, Encoding.UTF8))
+                string filePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tempfile.dat");
+                string fileName = Path.GetFileName(filePath);
+                if (File.Exists(filePath))
+                {
+                    string baseName = Path.GetFileNameWithoutExtension(filePath);
+                    string ext = Path.GetExtension(filePath);
+                    filePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, fileName);
+
+                    int counter = 1;
+
+                    while (File.Exists(filePath))
                     {
-                        string? usernameMessage = await reader.ReadLineAsync();
-                        if (usernameMessage == null) return;
-                        string username = usernameMessage.Replace("USERNAME:", "").Trim();
-                        ConnectedClients.TryAdd(username, client);
-                        Console.WriteLine($"{username} joined");
-                        Task receiveTask = ReceiveMessages(reader, username, token);
-                        Task sendTask = SendMessages(writer, token);
-                        await Task.WhenAny(receiveTask, sendTask);
+                        filePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+                            $"{baseName} (Copy{counter}){ext}");
+                        counter++;
                     }
+                }
+                string? clientUsername = reader.ReadLine();
+                if (clientUsername == null) return;
+                string trueUserName = clientUsername.Replace("USERNAME: ", "");
+                clients[trueUserName] = client;
+                Console.WriteLine($"{trueUserName} has connected.");
+                while (!token.IsCancellationRequested)
+                {
+                    byte[] buffer = new byte[81920];
+                    Array.Clear(buffer, 0, buffer.Length);
+                    int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                    string jsonMessage = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    ChatPackets? packet = JsonSerializer.Deserialize<ChatPackets>(jsonMessage);
+                    if (packet == null) break;
+                    if (packet.Type == ChatPackets.PacketType.Message)
+                    {
+                        BroadcastMessage(packet.Content ?? string.Empty, client);
+                        Console.WriteLine($"{clients.First(wag => wag.Value == client).Key}: {packet.Content}");
+                    }
+                    if (packet.Type == ChatPackets.PacketType.File)
+                    {
+                        BroadcastMessage($"Sent a file: {packet.FileName}", client);
+                        FileInfo sourceFile = new FileInfo(filePath);
+                        byte[] fileBytes = File.ReadAllBytes(filePath);
+                        int bytesSent = 0;
+                        long progress = 0;
+                        long totalBytes = sourceFile.Length;
+                        while ((bytesSent = await stream.ReadAsync(fileBytes, 0, fileBytes.Length, token)) > 0)
+                        {
+                            await stream.WriteAsync(fileBytes, 0, bytesSent, token);
+                            progress += bytesSent;
+                            Console.Write($"\rProgress: {(double)progress / totalBytes:P2}");
+                        }
+                        Console.WriteLine("\nFile copied Successfully");
+                    }
+                }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error handling client: {ex.Message}");
+                Console.WriteLine($"Error receiving message: {ex.Message}");
             }
         }
-        private static async Task ReceiveMessages(StreamReader reader, string username, CancellationToken token)
+        private async Task SendMessagesAsync(TcpClient client, StreamWriter writer, CancellationToken token)
         {
-            string? message;
-
-            while (!token.IsCancellationRequested &&
-                   (message = await reader.ReadLineAsync()) != null)
+            try
             {
-                Console.WriteLine($"{username}: {message}");
-
-                Broadcast(message, username);
-            }
-
-            ConnectedClients.TryRemove(username, out _);
-        }
-        private static async Task SendMessages(StreamWriter writer, CancellationToken token)
-        {
-            string? message;
-            while (!token.IsCancellationRequested)
-            {
-                message = Console.ReadLine();
-                if (message == null) continue;
-                await writer.WriteLineAsync(message);
-            }
-        }
-        private static void Broadcast(string message, string sender)
-        {
-            foreach (var client in ConnectedClients)
-            {
-                if (client.Key == sender) continue;
-
-                try
+                while (!token.IsCancellationRequested)
                 {
-                    var stream = client.Value.GetStream();
-                    var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
-                    writer.WriteLine($"{sender}: {message}");
-                }
-                catch
-                {
-                    // ignore dead clients for now
+                    string? message = await Task.Run(() => Console.ReadLine());
+                    if (message == null) break;
+                    string? serverMessage = $"SERVER: {message}";
+                    foreach (var kvp in clients)
+                    {
+                        using (NetworkStream stream = kvp.Value.GetStream())
+                        {
+                            writer.WriteLine(serverMessage);
+                        }
+                    }
+                           
                 }
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending message: {ex.Message}");
+            }
         }
-    }
+        private void BroadcastMessage(string message, TcpClient sender)
+        {
+            string senderUsername = clients.First(wag => wag.Value == sender).Key;
+            foreach (var kvp in clients)
+            {
+                TcpClient client = kvp.Value;
+                if (client != sender)
+                {
+                    try
+                    {
+                        using (NetworkStream stream = client.GetStream())
+                        using (StreamWriter writer = new StreamWriter(stream) { AutoFlush = true })
+                        {
+                            writer.WriteLine($"{senderUsername}: {message}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error broadcasting to {kvp.Key}: {ex.Message}");
+                    }
+                }
+            }
+        }
+    } 
 }
