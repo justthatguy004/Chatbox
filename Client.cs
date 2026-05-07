@@ -9,6 +9,7 @@ namespace Chatbox_Type_Shii
         private TcpClient? client;
         private CancellationTokenSource? cts;
 
+        //Start The Client
         public async Task StartClient(string? IP)
         {
             cts = new CancellationTokenSource();
@@ -19,6 +20,7 @@ namespace Chatbox_Type_Shii
                 if (IPAddress.TryParse(IP, out var parsed))
                 {
                     client.ConnectAsync(parsed, port).Wait(token);
+                    Console.WriteLine("Connected to server...");
                 }
                 else
                 {
@@ -32,92 +34,102 @@ namespace Chatbox_Type_Shii
             }
             await Task.Run(() => HandleMessages(client, token), token);
         }
+
+        //Handling Messages
         public async Task HandleMessages(TcpClient client, CancellationToken token)
         {
             {
                 NetworkStream stream = client.GetStream();
                 StreamReader reader = new StreamReader(stream);
                 StreamWriter writer = new StreamWriter(stream) { AutoFlush = true };
-                Task recieve = RecieveMessages(client, reader, stream, token);
-                Task send = SendMessages(client, writer, stream, token);
+                Console.Write("Please input your username: ");
+                string? username = Console.ReadLine();
+                if(username == null)
+                    throw new ArgumentException("Username cannot be null."); username = username.Trim();
+                ChatPackets packet = new ChatPackets();
+                packet.Type = ChatPackets.PacketType.UserJoined;
+                packet.Content = username;
+                packet.Username = username;
+                string jsonPacket = JsonSerializer.Serialize(packet);
+                await writer.WriteLineAsync(jsonPacket);
+                Task recieve = RecieveMessages(reader, stream, token);
+                Task send = SendMessages(username, writer, stream, token);
                 await Task.WhenAll(recieve, send);
             }
         }
-        public async Task SendMessages(TcpClient client, StreamWriter writer, NetworkStream stream, CancellationToken token)
+
+        //Recieving Messages
+        public async Task RecieveMessages(StreamReader reader, NetworkStream stream, CancellationToken token)
         {
-            string? userName;
-            string? input;
-            string? user;
-                Console.Write("Please enter your desired username: ");
-                input = Console.ReadLine();
-                while (true)
-                {
-                    if (string.IsNullOrWhiteSpace(input))
-                    {
-                        Console.Write("Username cannot be empty. Please enter a valid username: ");
-                    }
-                    else
-                    {
-                        userName = $"USERNAME: {input}";
-                        user = userName.Replace("USERNAME: ", "");
-                        await writer.WriteLineAsync(userName);
-                        break;
-                    }
-                }
-            Console.WriteLine($"Connected to server as {user}.");
-            Console.WriteLine(@"Please input \msg for messages and \file for file sharing before typing your message.");
-            while (!token.IsCancellationRequested)
+            try
             {
-                ChatPackets packet = new ChatPackets();
-                Console.Write("Enter message: ");
-                string? message = Console.ReadLine();
-                if (message == null) break;
-                if (message.StartsWith(@"\msg"))
+                ChatPackets? packet = new ChatPackets();
+                string? message;
+                while (!token.IsCancellationRequested)
                 {
-                    packet.Type = ChatPackets.PacketType.Message;
-                    packet.Username = user;
-                    packet.Content = message.Replace(@"\msg", "").Trim();
-                    string? json = JsonSerializer.Serialize(packet);
-                    await writer.WriteAsync(json);
-                    Console.WriteLine($"{user}: {message.Replace(@"\msg", "").Trim()}");
-                }
-                else if (message.StartsWith(@"\file"))
-                {
-                    Console.Write("Please input the file path: ");
-                    string? filePath = Console.ReadLine();
-                    if (!File.Exists(filePath))
+                    message = await reader.ReadLineAsync();
+                    if (message == null)
+                        break;
+                    packet = JsonSerializer.Deserialize<ChatPackets>(message);
+                    if (packet != null)
                     {
-                        Console.WriteLine("File not found.");
-                        continue;
+                        Console.WriteLine($"Received {packet.Type} from {packet.Username}");
+                        switch (packet.Type)
+                        {
+                            case ChatPackets.PacketType.Message:
+                                Console.WriteLine($"Message from {packet.Username}: {packet.Content}");
+                                break;
+                            case ChatPackets.PacketType.File:
+                                Console.WriteLine($"File from {packet.Username}: {packet.FileName} to be saved at {packet.DestinationDirectory}");
+                                break;
+                            case ChatPackets.PacketType.UserList:
+                                Console.WriteLine($"User list requested by {packet.Username}");
+                                break;
+                            case ChatPackets.PacketType.UserJoined:
+                                Console.WriteLine($"{packet.Username} has joined the chat.");
+                                break;
+                            case ChatPackets.PacketType.UserLeft:
+                                Console.WriteLine($"{packet.Username} has left the chat.");
+                                break;
+                        }
                     }
-                    Console.Write("\nPlease input the destination directory: ");
-                    string? destinationDirectory = Console.ReadLine();
-                    packet.Type = ChatPackets.PacketType.File;
-                    packet.Username = userName;
-                    packet.Content = filePath;
-                    packet.DestinationDirectory = destinationDirectory;
-                    packet.FileName = Path.GetFileName(filePath);
-                    FileInfo sourceFile = new FileInfo(filePath);
-                    byte[] fileBytes = File.ReadAllBytes(filePath);
-                    byte[] buffer = new byte[81920];
-                    int bytesSent = 0;
-                    long progress = 0;
-                    long totalBytes = sourceFile.Length;
-                    while ((bytesSent = await stream.ReadAsync(fileBytes, 0, buffer.Length, token)) > 0)
-                    {
-                        await stream.WriteAsync(buffer, 0, bytesSent, token);
-                        progress += bytesSent;
-                        Console.Write($"\rProgress: {(double)progress / totalBytes:P2}");
-                    }
-                    Console.WriteLine("\nFile copied Successfully");
                 }
-
             }
-
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error receiving messages: {ex.Message}");
+            }
         }
-        public async Task RecieveMessages(TcpClient client, StreamReader reader, NetworkStream stream, CancellationToken token)
+
+        //Sending Messages
+        public async Task SendMessages(string username, StreamWriter writer, NetworkStream stream, CancellationToken token)
         {
-            
+            try
+            {
+                Console.WriteLine("You can start sending messages...");
+                Console.WriteLine(@"use \msg to send a message and \file to send a file...");
+                while (!token.IsCancellationRequested)
+                {
+                    string? input = Console.ReadLine();
+                    if (input == null)
+                        continue;
+                    if (input.StartsWith("\\msg"))
+                    {
+                        ChatPackets packet = new ChatPackets
+                        {
+                            Type = ChatPackets.PacketType.Message,
+                            Username = username,
+                            Content = input
+                        };
+                        string jsonPacket = JsonSerializer.Serialize(packet);
+                        await writer.WriteLineAsync(jsonPacket);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending messages: {ex.Message}");
+            }
         }
     }
 }
