@@ -30,7 +30,7 @@ switch (choice)
         Server server = new Server();
         Console.WriteLine("Please input your desired IP to host server, may leave blank for default: ");
         input = Console.ReadLine();
-        await server.StartServer(input);
+        await server.StartServer();
         break;
     case 2:
         Client client = new Client();

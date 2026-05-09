@@ -13,7 +13,10 @@
         public PacketType Type { get; set; }
         public string? Username { get; set; }
         public string? Content { get; set; }
-        public string? FileName { get; set; }
+        public string FileName { get; set; } = "";
         public string? DestinationDirectory { get; set; }
+        public string TargetUsername { get; set; } = "";
+        public long FileSize { get; set; }
+        public string? FileExtension { get; set; }
     }
 }

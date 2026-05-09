@@ -64,10 +64,12 @@ namespace Chatbox_Type_Shii
                     throw new Exception("Username cannot be null, exiting...");
                 string? username = imessage.Replace("USERNAME: ", ""); 
                 clients.TryAdd(username, client); */
+                Task recieve;
+                Task send;
                 while (!token.IsCancellationRequested)
                 {
-                    Task recieve = RecieveMessages(client, reader, stream, token);
-                    Task send = SendMessages(token);
+                    recieve = RecieveMessages(client, reader, stream, token);
+                    send = SendMessages(token);
                     await Task.WhenAny(recieve, send);
                 }
             }
@@ -84,9 +86,20 @@ namespace Chatbox_Type_Shii
             {
                 ChatPackets? packet = new ChatPackets();
                 string? message;
+                byte[] lengthBuffer = new byte[4];
+                byte[] messageBuffer;
                 while (!token.IsCancellationRequested)
                 {
-                    message = await reader.ReadLineAsync();
+                    int v = await stream.ReadAsync(lengthBuffer, 0, lengthBuffer.Length, token);
+                    int messageLength = BitConverter.ToInt32(lengthBuffer, 0);
+                    messageLength = BitConverter.ToInt32(lengthBuffer, 0);
+                    if (messageLength <= 0 || messageLength > 10_000_000)
+                    {
+                        throw new Exception("Invalid packet size.");
+                    }
+                    messageBuffer = new byte[messageLength];
+                    await stream.ReadExactlyAsync(messageBuffer, 0, messageBuffer.Length, token);
+                    message = Encoding.UTF8.GetString(messageBuffer);
                     if (message == null)
                         break;
                     packet = JsonSerializer.Deserialize<ChatPackets>(message);
@@ -100,36 +113,43 @@ namespace Chatbox_Type_Shii
                                 await BroadcastMessageAsync(client, packet, token);
                                 break;
                             case ChatPackets.PacketType.File:
+                                packet.DestinationDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), packet.FileName);
                                 Console.WriteLine($"File from {packet.Username}: {packet.FileName} to be saved at {packet.DestinationDirectory}");
+                                TcpClient? tcpClient = clients.TryGetValue(packet.TargetUsername, out TcpClient? targetclient) ? targetclient : null;
+                                if(targetclient == null)
+                                    break;
+                                NetworkStream targetStream = targetclient.GetStream();
+                                string? json = JsonSerializer.Serialize(packet);
+                                byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
+                                byte[] lengthPrefix = BitConverter.GetBytes(jsonBytes.Length);
+                                await targetStream.WriteAsync(lengthPrefix, 0, lengthPrefix.Length, token);
+                                await targetStream.WriteAsync(jsonBytes, 0, jsonBytes.Length, token);
+                                    int amountRecieved = 0;
+                                    byte[] buffer = new byte[81920];
+                                    while (amountRecieved < packet.FileSize)
+                                    {
+                                        int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, token);
+                                        if (bytesRead == 0)
+                                            break;
+                                        await targetStream.WriteAsync(buffer, 0, bytesRead, token);
+                                        amountRecieved += bytesRead;
+                                    }
                                 break;
                             case ChatPackets.PacketType.UserList:
                                 Console.WriteLine($"User list requested by {packet.Username}");
                                 break;
                             case ChatPackets.PacketType.UserJoined:
                                 Console.WriteLine($"{packet.Username} has joined the chat.");
-                                if(packet.Username == null)
+                                ChatPackets packets = new ChatPackets
+                                {
+                                    Type = ChatPackets.PacketType.Message,
+                                    Username = "SERVER",
+                                    Content = $"{packet.Username} has joined the chat."
+                                };
+                                await BroadcastMessageAsync(packets, token);
+                                if (packet.Username == null)
                                     throw new Exception("Username cannot be null, exiting...");
                                 clients.TryAdd(packet.Username, client);
-                                foreach (var kvp in clients)
-                                {
-                                    TcpClient iclient = kvp.Value;
-                                    try
-                                    {
-                                        NetworkStream istream = iclient.GetStream();
-                                        StreamWriter writer = new StreamWriter(istream) { AutoFlush = true };
-                                        ChatPackets joinPacket = new ChatPackets
-                                        {
-                                            Type = ChatPackets.PacketType.UserJoined,
-                                            Username = packet.Username,
-                                        };
-                                        string jsonJoinPacket = JsonSerializer.Serialize(joinPacket);
-                                        await writer.WriteLineAsync(jsonJoinPacket);
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        Console.WriteLine($"Error broadcasting to {kvp.Key}: {ex.Message}");
-                                    }
-                                }
                                 break;
                             case ChatPackets.PacketType.UserLeft:
                                 Console.WriteLine($"{packet.Username} has left the chat.");
@@ -150,15 +170,17 @@ namespace Chatbox_Type_Shii
         //Broadcasting Messages
         public async Task BroadcastMessageAsync(ChatPackets packet, CancellationToken token)
         {
-            string? json = JsonSerializer.Serialize(packet);
+            string? jsonPacket = JsonSerializer.Serialize(packet);
             foreach (var kvp in clients)
             {
                 TcpClient client = kvp.Value;
                 try
                 {
                     NetworkStream stream = client.GetStream();
-                    StreamWriter writer = new StreamWriter(stream) { AutoFlush = true };
-                    await writer.WriteLineAsync(json);
+                    byte[] jsonBytes = Encoding.UTF8.GetBytes(jsonPacket);
+                    byte[] lengthPrefix = BitConverter.GetBytes(jsonBytes.Length);
+                    await stream.WriteAsync(lengthPrefix);
+                    await stream.WriteAsync(jsonBytes);
                 }
                 catch (Exception ex)
                 {
@@ -169,7 +191,7 @@ namespace Chatbox_Type_Shii
         }
         public async Task BroadcastMessageAsync(TcpClient sender, ChatPackets packet, CancellationToken token)
         {
-            string? json = JsonSerializer.Serialize(packet);
+            string? jsonPacket = JsonSerializer.Serialize(packet);
             foreach (var kvp in clients)
             {
                 TcpClient client = kvp.Value;
@@ -178,8 +200,10 @@ namespace Chatbox_Type_Shii
                 try
                 {
                     NetworkStream stream = client.GetStream();
-                    StreamWriter writer = new StreamWriter(stream) { AutoFlush = true };
-                    await writer.WriteLineAsync(json);
+                    byte[] jsonBytes = Encoding.UTF8.GetBytes(jsonPacket);
+                    byte[] lengthPrefix = BitConverter.GetBytes(jsonBytes.Length);
+                    await stream.WriteAsync(lengthPrefix);
+                    await stream.WriteAsync(jsonBytes);
                 }
                 catch (Exception ex)
                 {

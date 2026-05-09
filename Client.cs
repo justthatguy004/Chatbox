@@ -8,6 +8,8 @@ namespace Chatbox_Type_Shii
         private readonly int port = 5000;
         private TcpClient? client;
         private CancellationTokenSource? cts;
+        public string? filePath { get; private set; }
+        public string? targetUsername { get; private set; }
 
         //Start The Client
         public async Task StartClient(string? IP)
@@ -38,10 +40,10 @@ namespace Chatbox_Type_Shii
         //Handling Messages
         public async Task HandleMessages(TcpClient client, CancellationToken token)
         {
+            Task recieve;
+            Task send;
             {
                 NetworkStream stream = client.GetStream();
-                StreamReader reader = new StreamReader(stream);
-                StreamWriter writer = new StreamWriter(stream) { AutoFlush = true };
                 Console.Write("Please input your username: ");
                 string? username = Console.ReadLine();
                 if(username == null)
@@ -51,23 +53,36 @@ namespace Chatbox_Type_Shii
                 packet.Content = username;
                 packet.Username = username;
                 string jsonPacket = JsonSerializer.Serialize(packet);
-                await writer.WriteLineAsync(jsonPacket);
-                Task recieve = RecieveMessages(reader, stream, token);
-                Task send = SendMessages(username, writer, stream, token);
+                byte[] jsonBytes = Encoding.UTF8.GetBytes(jsonPacket);
+                byte[] lengthPrefix = BitConverter.GetBytes(jsonBytes.Length);
+                await stream.WriteAsync(lengthPrefix);
+                await stream.WriteAsync(jsonBytes);
+                recieve = RecieveMessages(stream, token);
+                send = SendMessages(username, stream, token);
                 await Task.WhenAll(recieve, send);
             }
         }
 
         //Recieving Messages
-        public async Task RecieveMessages(StreamReader reader, NetworkStream stream, CancellationToken token)
+        public async Task RecieveMessages( NetworkStream stream, CancellationToken token)
         {
             try
             {
                 ChatPackets? packet = new ChatPackets();
                 string? message;
+                byte[] lengthBuffer = new byte[4];
+                byte[] messageBuffer;
                 while (!token.IsCancellationRequested)
                 {
-                    message = await reader.ReadLineAsync();
+                    int v = await stream.ReadAsync(lengthBuffer, 0, lengthBuffer.Length, token);
+                    int messageLength = BitConverter.ToInt32(lengthBuffer);
+                    if (messageLength <= 0 || messageLength > 10_000_000)
+                    {
+                        throw new Exception("Invalid packet size.");
+                    }
+                    messageBuffer = new byte[messageLength];
+                    await stream.ReadExactlyAsync(messageBuffer, token);
+                    message = Encoding.UTF8.GetString(messageBuffer);
                     if (message == null)
                         break;
                     packet = JsonSerializer.Deserialize<ChatPackets>(message);
@@ -81,6 +96,24 @@ namespace Chatbox_Type_Shii
                                 break;
                             case ChatPackets.PacketType.File:
                                 Console.WriteLine($"File from {packet.Username}: {packet.FileName} to be saved at {packet.DestinationDirectory}");
+                                string destinationDirectory = packet.DestinationDirectory ?? $@"{Environment.GetFolderPath(Environment.SpecialFolder.Desktop)}\Chatbox Files";
+                                if (!Directory.Exists(destinationDirectory))
+                                    Directory.CreateDirectory(destinationDirectory);
+                                string destinationPath = Path.Combine(destinationDirectory, packet.FileName);
+                                using (FileStream fs = new FileStream(destinationPath, FileMode.Create, FileAccess.Write))
+                                {
+                                    byte[] buffer = new byte[81920];
+                                    int bytesRead;
+                                    long totalBytesRead = 0;
+                                    long fileSize = (long)packet.FileSize;
+                                    while (totalBytesRead < packet.FileSize && (bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                                    {
+                                        await fs.WriteAsync(buffer, 0, bytesRead);
+                                        totalBytesRead += bytesRead;
+                                        Console.Write($"\rProgress: {((double)totalBytesRead / fileSize):P2}");
+                                    }
+                                    Console.Write($"\nFile {packet.FileName} received successfully.");
+                                }
                                 break;
                             case ChatPackets.PacketType.UserList:
                                 Console.WriteLine($"User list requested by {packet.Username}");
@@ -102,7 +135,7 @@ namespace Chatbox_Type_Shii
         }
 
         //Sending Messages
-        public async Task SendMessages(string username, StreamWriter writer, NetworkStream stream, CancellationToken token)
+        public async Task SendMessages(string username, NetworkStream stream, CancellationToken token)
         {
             try
             {
@@ -113,16 +146,58 @@ namespace Chatbox_Type_Shii
                     string? input = Console.ReadLine();
                     if (input == null)
                         continue;
-                    if (input.StartsWith("\\msg"))
+                    if (input.StartsWith(@"\msg"))
                     {
                         ChatPackets packet = new ChatPackets
                         {
                             Type = ChatPackets.PacketType.Message,
                             Username = username,
-                            Content = input
+                            Content = input.Replace(@"\msg", "").Trim()
                         };
                         string jsonPacket = JsonSerializer.Serialize(packet);
-                        await writer.WriteLineAsync(jsonPacket);
+                        byte[] jsonBytes = Encoding.UTF8.GetBytes(jsonPacket);
+                        byte[] lengthPrefix = BitConverter.GetBytes(jsonBytes.Length);
+                        await stream.WriteAsync(lengthPrefix);
+                        await stream.WriteAsync(jsonBytes);
+                    }
+                    if (input.StartsWith(@"\file"))
+                    {
+                        do
+                        {
+                            Console.Write("Enter the file path: ");
+                            filePath = Console.ReadLine();
+                            Console.Write("Enter the target username: ");
+                            targetUsername = Console.ReadLine();
+                        } while (File.Exists(filePath) == false || string.IsNullOrEmpty(targetUsername));
+                        FileInfo fileInfo = new FileInfo(filePath);
+                        ChatPackets packets = new ChatPackets
+                        {
+                            Type = ChatPackets.PacketType.File,
+                            Username = username,
+                            FileName = fileInfo.Name,
+                            FileExtension = fileInfo.Extension.TrimStart('.'),
+                            FileSize = (long)fileInfo.Length,
+                            TargetUsername = targetUsername
+                        };
+                        string jsonPacket = JsonSerializer.Serialize(packets);
+                        byte[] jsonBytes = Encoding.UTF8.GetBytes(jsonPacket);
+                        byte[] lengthPrefix = BitConverter.GetBytes(jsonBytes.Length);
+                        await stream.WriteAsync(lengthPrefix);
+                        await stream.WriteAsync(jsonBytes);
+                        using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+                        {
+                            byte[] buffer = new byte[81920];
+                            int bytesRead;
+                            long totalBytesRead = 0;
+                            long fileSize = packets.FileSize;
+                            while ((bytesRead = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                            {
+                                await stream.WriteAsync(buffer, 0, bytesRead);
+                                totalBytesRead += bytesRead;
+                                Console.Write($"\rProgress: {((double)totalBytesRead / fileSize):P2}");
+                            }
+                            Console.WriteLine($"\nFile {packets.FileName} sent successfully.");
+                        }
                     }
                 }
             }
